@@ -65,8 +65,8 @@ def safe_get(d: Dict, *keys, default=None):
 def get_llm(temperature: float = 0.3, creative: bool = False):
     provider = os.getenv("LLM_PROVIDER", "groq").lower()
     temp = 0.7 if creative else temperature
-    # Use widely available free-tier model
-    model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    # Model available on this Groq account (from user screenshot)
+    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
     if provider == "groq" and os.getenv("GROQ_API_KEY"):
         return ChatGroq(
