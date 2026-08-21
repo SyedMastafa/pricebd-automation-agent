@@ -1,0 +1,155 @@
+{
+  "name": "PriceBD - X + Facebook Auto Post",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pricebd-social",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "pricebd-social"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Accept body: { posts: [ { platform, text, hashtags, cta } ] }\n// Or single post fields at top level\nconst body = $input.first().json.body || $input.first().json;\nlet posts = body.posts || body.social_posts || [];\n\nif (!Array.isArray(posts) || posts.length === 0) {\n  // Fallback: treat whole body as one post\n  if (body.text) {\n    posts = [{ platform: body.platform || 'x', text: body.text, hashtags: body.hashtags || [] }];\n  }\n}\n\nif (!posts.length) {\n  throw new Error('No posts found. Send JSON: { \\"posts\\": [ { \\"platform\\": \\"x\\", \\"text\\": \\"...\\" } ] }');\n}\n\n// Normalize + pick best posts for each platform\nconst normalized = posts.map(p => {\n  const tags = (p.hashtags || []).map(h => h.startsWith('#') ? h : '#' + h).join(' ');\n  let text = (p.text || '').trim();\n  if (tags && !text.includes('#')) text = text + '\\n' + tags;\n  if (p.cta && !text.includes(p.cta)) text = text + '\\n' + p.cta;\n  // Prefer PriceBD URL\n  if (!text.includes('pricebd') && !text.includes('http')) {\n    text = text + '\\nhttps://pricebd.lovable.app';\n  }\n  return {\n    platform: (p.platform || 'x').toLowerCase(),\n    text: text.slice(0, 280), // X limit safe\n    text_long: text.slice(0, 2000), // FB allows longer\n  };\n});\n\nconst xPost = normalized.find(p => p.platform === 'x' || p.platform === 'twitter') || normalized[0];\nconst fbPost = normalized.find(p => p.platform === 'facebook' || p.platform === 'fb') || normalized[0];\n\nreturn [\n  { json: { x_text: xPost.text, fb_text: fbPost.text_long, all: normalized, count: normalized.length } }\n];"
+      },
+      "id": "prepare-posts",
+      "name": "Prepare Posts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.x_text }}",
+        "additionalFields": {}
+      },
+      "id": "twitter-post",
+      "name": "Post to X (Twitter)",
+      "type": "n8n-nodes-base.twitter",
+      "typeVersion": 2,
+      "position": [700, 200],
+      "credentials": {
+        "twitterOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_X_CREDENTIAL_ID",
+          "name": "X OAuth2"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "message": "={{ $json.fb_text }}",
+        "options": {}
+      },
+      "id": "facebook-post",
+      "name": "Post to Facebook Page",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [700, 400],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "REPLACE_WITH_YOUR_FB_CREDENTIAL_ID",
+          "name": "Facebook Graph API"
+        }
+      },
+      "continueOnFail": true,
+      "parameters": {
+        "httpRequestMethod": "POST",
+        "graphApiVersion": "v19.0",
+        "node": "me/feed",
+        "options": {},
+        "queryParameters": {
+          "parameter": [
+            {
+              "name": "message",
+              "value": "={{ $('Prepare Posts').item.json.fb_text }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, message: 'Posts processed', x: $('Post to X (Twitter)').item.json, facebook: $('Post to Facebook Page').item.json }) }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [940, 300]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 4 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule",
+      "name": "Daily 10AM BST (optional)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 520],
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Demo posts when using schedule without webhook payload\nreturn [{\n  json: {\n    body: {\n      posts: [\n        {\n          platform: 'x',\n          text: 'Find the lowest prices in Bangladesh on PriceBD. Live comparison from Daraz, Star Tech & more.',\n          hashtags: ['#PriceBD', '#BDDeals'],\n          cta: 'https://pricebd.lovable.app'\n        },\n        {\n          platform: 'facebook',\n          text: 'Tired of checking multiple sites? PriceBD compares live prices across major stores in Bangladesh. Start saving today!',\n          hashtags: ['#PriceBD'],\n          cta: 'https://pricebd.lovable.app'\n        }\n      ]\n    }\n  }\n}];"
+      },
+      "id": "demo-posts",
+      "name": "Demo Posts (schedule)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 520],
+      "disabled": true
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Prepare Posts", "type": "main", "index": 0 }]]
+    },
+    "Prepare Posts": {
+      "main": [
+        [
+          { "node": "Post to X (Twitter)", "type": "main", "index": 0 },
+          { "node": "Post to Facebook Page", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Post to X (Twitter)": {
+      "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]]
+    },
+    "Post to Facebook Page": {
+      "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]]
+    },
+    "Daily 10AM BST (optional)": {
+      "main": [[{ "node": "Demo Posts (schedule)", "type": "main", "index": 0 }]]
+    },
+    "Demo Posts (schedule)": {
+      "main": [[{ "node": "Prepare Posts", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    { "name": "PriceBD" },
+    { "name": "social" }
+  ],
+  "pinData": {}
+}
