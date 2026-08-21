@@ -21,7 +21,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-# ====================== LOGGING ======================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -29,13 +28,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PriceBD-Agent")
 
-# ====================== HELPERS ======================
 def extract_json(text: str) -> Any:
-    """Robustly extract JSON object or array from LLM response."""
     if not text:
         return None
+    text = text.strip()
     try:
         return json.loads(text)
+    except Exception:
+        pass
+    # Remove markdown code fences
+    cleaned = re.sub(r"```(?:json)?\s*", "", text)
+    cleaned = re.sub(r"\s*```", "", cleaned).strip()
+    try:
+        return json.loads(cleaned)
     except Exception:
         pass
     for start_char, end_char in [("{", "}"), ("[", "]")]:
@@ -46,12 +51,8 @@ def extract_json(text: str) -> Any:
                 return json.loads(text[start:end + 1])
             except Exception:
                 continue
-    cleaned = re.sub(r"```json\s*|\s*```", "", text).strip()
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        logger.warning("Failed to parse JSON from LLM response")
-        return {"raw": text, "error": "json_parse_failed"}
+    logger.warning("Failed to parse JSON. Raw preview: %s", text[:300])
+    return {"raw": text[:500], "error": "json_parse_failed"}
 
 def safe_get(d: Dict, *keys, default=None):
     for k in keys:
@@ -61,12 +62,11 @@ def safe_get(d: Dict, *keys, default=None):
             return default
     return d
 
-# ====================== LLM SETUP (FREE) ======================
 def get_llm(temperature: float = 0.3, creative: bool = False):
     provider = os.getenv("LLM_PROVIDER", "groq").lower()
-    temp = 0.7 if creative else temperature
-    # Model available on this Groq account (from user screenshot)
-    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    temp = 0.6 if creative else temperature
+    # Stronger model available on this account
+    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
     if provider == "groq" and os.getenv("GROQ_API_KEY"):
         return ChatGroq(
@@ -84,7 +84,6 @@ def get_llm(temperature: float = 0.3, creative: bool = False):
     else:
         raise ValueError("No LLM API key found. Set GROQ_API_KEY or GOOGLE_API_KEY in .env")
 
-# ====================== BRAND ======================
 def get_brand_info() -> Dict[str, str]:
     return {
         "name": os.getenv("BRAND_NAME", "PriceBD"),
@@ -102,7 +101,6 @@ def get_brand_info() -> Dict[str, str]:
         )
     }
 
-# ====================== STATE ======================
 class AgentState(TypedDict):
     messages: Annotated[List, add_messages]
     current_goal: str
@@ -115,8 +113,6 @@ class AgentState(TypedDict):
     brand_info: Dict[str, str]
     error: Optional[str]
 
-# ====================== SUB-AGENTS ======================
-
 def seo_agent(state: AgentState) -> AgentState:
     logger.info("Running SEO Agent...")
     brand = state.get("brand_info") or get_brand_info()
@@ -128,34 +124,26 @@ Product: {brand['description']}
 Date: {datetime.now().strftime('%Y-%m-%d')}
 Market: Bangladesh (English + Bangla searchers)
 
-Focus on high-intent keywords people actually search:
-- "iPhone 16 price in Bangladesh"
-- "best laptop under 50000 BD"
-- "Daraz vs Star Tech"
-- "Samsung TV price BD"
-- Current deals, price drops, store comparisons
+Focus on high-intent keywords:
+- iPhone 16 price in Bangladesh
+- best laptop under 50000 BD
+- Daraz vs Star Tech
+- Samsung TV price BD
+- price drop alerts Bangladesh
 
 Tasks:
-1. Give 8 high-potential keywords / topics with priority (high/medium).
-2. Suggest meta title + meta description for:
-   - Homepage
-   - One brand page (e.g. Apple)
-   - One category page (e.g. Laptops)
-3. List 4 quick technical SEO wins for a price comparison site.
-4. Internal linking ideas (deals ↔ brands ↔ stores ↔ products).
+1. 8 high-potential keywords with priority (high/medium).
+2. Meta title + description for homepage, one brand page (Apple), one category (Laptops).
+3. 4 technical SEO wins for a price comparison site.
+4. Internal linking ideas.
 
-Return ONLY valid JSON:
+IMPORTANT: Return ONLY a valid JSON object. No markdown, no explanation, no code fences.
+
 {{
-  "priority_keywords": [
-    {{"keyword": "...", "intent": "transactional/informational", "priority": "high/medium"}}
-  ],
-  "content_topics": [
-    {{"title": "...", "keyword": "...", "search_intent": "...", "priority": "high/medium"}}
-  ],
-  "meta_suggestions": [
-    {{"page": "homepage", "title": "...", "description": "..."}}
-  ],
-  "technical_wins": ["...", "..."],
+  "priority_keywords": [{{"keyword": "...", "intent": "transactional", "priority": "high"}}],
+  "content_topics": [{{"title": "...", "keyword": "...", "search_intent": "...", "priority": "high"}}],
+  "meta_suggestions": [{{"page": "homepage", "title": "...", "description": "..."}}],
+  "technical_wins": ["..."],
   "internal_linking": ["..."]
 }}"""
 
@@ -163,11 +151,11 @@ Return ONLY valid JSON:
         llm = get_llm(temperature=0.2)
         response = llm.invoke([HumanMessage(content=prompt)])
         insights = extract_json(response.content)
-        if not isinstance(insights, dict):
-            insights = {"error": "invalid_format", "raw": str(insights)}
+        if not isinstance(insights, dict) or insights.get("error"):
+            insights = {"error": str(insights), "content_topics": []}
     except Exception as e:
         logger.error(f"SEO Agent error: {e}")
-        insights = {"error": str(e)}
+        insights = {"error": str(e), "content_topics": []}
 
     state["seo_insights"] = insights
     state["actions_taken"] = state.get("actions_taken", []) + ["SEO analysis completed"]
@@ -176,64 +164,60 @@ Return ONLY valid JSON:
 def content_agent(state: AgentState) -> AgentState:
     logger.info("Running Content Agent...")
     brand = state.get("brand_info") or get_brand_info()
-    seo = state.get("seo_insights", {})
-    topics = safe_get(seo, "content_topics", default=[])[:4]
+    seo = state.get("seo_insights", {}) or {}
+    topics = safe_get(seo, "content_topics", default=[]) or []
+    topics = topics[:3]
+
+    # Fallback topics if SEO returned nothing
+    if not topics:
+        topics = [
+            {"title": "How to Find the Best iPhone Deals in Bangladesh", "keyword": "iPhone price in Bangladesh", "search_intent": "informational", "priority": "high"},
+            {"title": "Best Laptops Under 50000 BDT in 2026", "keyword": "best laptop under 50000 BD", "search_intent": "informational", "priority": "high"},
+            {"title": "Daraz vs Star Tech Price Comparison", "keyword": "Daraz vs Star Tech", "search_intent": "informational", "priority": "high"}
+        ]
 
     prompt = f"""You are a content marketing expert for {brand['name']}.
 Brand voice: {brand['voice']}
 Website: {brand['url']}
 About: {brand['description']}
 
-Audience: Bangladeshi shoppers looking for lowest prices on mobiles, laptops, electronics, appliances.
+Audience: Bangladeshi shoppers looking for lowest prices.
 
-SEO topics to use:
-{json.dumps(topics, ensure_ascii=False, indent=2)}
+Use these topics:
+{json.dumps(topics, ensure_ascii=False)}
 
-Generate high-quality content:
+Generate:
+1. For each of the 3 topics: blog title, keyword, outline (3-5 H2s), and a 120-word introduction that mentions live price comparison on PriceBD.
+2. Exactly 4 social captions (platforms: x, linkedin, facebook, instagram).
+3. One newsletter with subject, preview_text, outline.
 
-1. For top 3 topics → full blog outline (H2/H3) + 120-160 word introduction.
-   Always mention the benefit of live price comparison on PriceBD.
-2. 4 social media posts:
-   - X/Twitter (max 260 chars, engaging)
-   - LinkedIn (professional)
-   - Facebook (friendly + call to action)
-   - General / Instagram style
-3. One newsletter:
-   - Subject line (curiosity + urgency)
-   - Short body outline focused on today's best price drops or weekly deals
+IMPORTANT: Return ONLY a valid JSON object. No markdown fences, no extra text.
 
-Return ONLY valid JSON:
 {{
   "blog_drafts": [
-    {{
-      "title": "...",
-      "keyword": "...",
-      "outline": ["H2: ...", "H3: ..."],
-      "introduction": "..."
-    }}
+    {{"title": "...", "keyword": "...", "outline": ["H2: ...", "H2: ..."], "introduction": "..."}}
   ],
   "social_captions": [
-    {{"platform": "x", "text": "...", "hashtags": ["#PriceBD", "#Deal"]}},
+    {{"platform": "x", "text": "...", "hashtags": ["#PriceBD"]}},
     {{"platform": "linkedin", "text": "..."}},
     {{"platform": "facebook", "text": "..."}},
     {{"platform": "instagram", "text": "..."}}
   ],
-  "newsletter": {{
-    "subject": "...",
-    "preview_text": "...",
-    "outline": "..."
-  }}
+  "newsletter": {{"subject": "...", "preview_text": "...", "outline": "..."}}
 }}"""
 
     try:
         llm = get_llm(creative=True)
         response = llm.invoke([HumanMessage(content=prompt)])
+        logger.info("Content Agent raw response length: %s", len(response.content or ""))
         data = extract_json(response.content)
         if not isinstance(data, dict):
             data = {}
-        state["content_ideas"] = data.get("blog_drafts", [])
-        state["social_posts"] = data.get("social_captions", [])
-        state["seo_insights"]["newsletter"] = data.get("newsletter", {})
+        state["content_ideas"] = data.get("blog_drafts") or []
+        state["social_posts"] = data.get("social_captions") or []
+        if isinstance(state.get("seo_insights"), dict):
+            state["seo_insights"]["newsletter"] = data.get("newsletter") or {}
+        logger.info("Content ideas: %s | Social posts: %s", len(state["content_ideas"]), len(state["social_posts"]))
     except Exception as e:
         logger.error(f"Content Agent error: {e}")
         state["content_ideas"] = []
@@ -245,41 +229,37 @@ Return ONLY valid JSON:
 def social_agent(state: AgentState) -> AgentState:
     logger.info("Running Social Agent...")
     brand = state.get("brand_info") or get_brand_info()
-    posts = state.get("social_posts", [])
+    posts = state.get("social_posts") or []
 
     if not posts:
-        state["actions_taken"] = state.get("actions_taken", []) + ["Social Agent skipped (no posts)"]
+        # Generate default social posts if content agent returned none
+        posts = [
+            {"platform": "x", "text": f"Find the lowest prices in Bangladesh on {brand['name']}. Live comparison from Daraz, Star Tech & more. {brand['url']}", "hashtags": ["#PriceBD", "#BDDeals"]},
+            {"platform": "facebook", "text": f"Tired of checking multiple sites for the best price? {brand['name']} compares live prices across major stores in Bangladesh. Start saving today!", "hashtags": ["#PriceBD"]}
+        ]
+        state["social_posts"] = posts
+        state["actions_taken"] = state.get("actions_taken", []) + ["Social posts generated (fallback)"]
         return state
 
     prompt = f"""You are a social media expert for {brand['name']} ({brand['url']}).
 Brand voice: {brand['voice']}
 
+Improve these posts. Keep them engaging, add max 3 hashtags, suggest best time (Bangladesh).
+
 Current posts:
-{json.dumps(posts, ensure_ascii=False, indent=2)}
+{json.dumps(posts, ensure_ascii=False)}
 
-Improve every post:
-- Make them more engaging and click-worthy
-- Keep platform character limits in mind
-- Add 2-4 relevant hashtags maximum
-- Suggest best time to post (Bangladesh time)
-- Ensure call-to-action points to PriceBD
+IMPORTANT: Return ONLY a valid JSON array. No markdown, no explanation.
 
-Return ONLY a valid JSON array:
 [
-  {{
-    "platform": "x",
-    "text": "...",
-    "hashtags": ["#PriceBD", "#BDDeals"],
-    "best_time_bst": "10:00 AM or 8:00 PM",
-    "cta": "Compare now on PriceBD"
-  }}
+  {{"platform": "x", "text": "...", "hashtags": ["#PriceBD"], "best_time_bst": "10:00 AM", "cta": "Compare on PriceBD"}}
 ]"""
 
     try:
         llm = get_llm(creative=True)
         response = llm.invoke([HumanMessage(content=prompt)])
         refined = extract_json(response.content)
-        if isinstance(refined, list):
+        if isinstance(refined, list) and refined:
             state["social_posts"] = refined
         else:
             state["social_posts"] = posts
@@ -293,35 +273,26 @@ def reply_agent(state: AgentState) -> AgentState:
     logger.info("Running Reply Agent...")
     brand = state.get("brand_info") or get_brand_info()
 
-    prompt = f"""You are a customer success + support agent for {brand['name']}.
+    prompt = f"""You are a customer success agent for {brand['name']}.
 Brand voice: {brand['voice']}
 Website: {brand['url']}
 About: {brand['description']}
 
-Create professional, helpful reply templates for these common situations:
+Create ready-to-send reply templates for:
+1. "Is this the lowest price?"
+2. Wrong / outdated price report
+3. Price alert request
+4. How often prices update
+5. Comparison with another site
+6. Positive feedback
+7. Specific product availability
+8. How PriceBD works
 
-1. User asks "Is this the lowest price?"
-2. User reports wrong / outdated price
-3. User wants price alert / notification
-4. User asks how often prices are updated
-5. User compares with another site
-6. Positive feedback / thank you
-7. User asks about a specific product availability
-8. General inquiry about how PriceBD works
+IMPORTANT: Return ONLY valid JSON. No markdown.
 
-For each:
-- Write a complete, ready-to-send reply
-- Keep it professional yet friendly
-- Include a soft call-to-action when relevant
-
-Return ONLY valid JSON:
 {{
   "templates": [
-    {{
-      "situation": "...",
-      "reply": "...",
-      "follow_up_action": "optional next step"
-    }}
+    {{"situation": "...", "reply": "...", "follow_up_action": "..."}}
   ]
 }}"""
 
@@ -330,7 +301,7 @@ Return ONLY valid JSON:
         response = llm.invoke([HumanMessage(content=prompt)])
         data = extract_json(response.content)
         if isinstance(data, dict):
-            state["reply_suggestions"] = data.get("templates", [])
+            state["reply_suggestions"] = data.get("templates") or []
         else:
             state["reply_suggestions"] = []
     except Exception as e:
@@ -384,8 +355,6 @@ def report_agent(state: AgentState) -> AgentState:
     state["final_report"] = "\n".join(report_lines)
     return state
 
-# ====================== CENTRAL BRAIN ======================
-
 def central_brain(state: AgentState) -> AgentState:
     goal = state.get("current_goal", "full_daily_run")
     logger.info(f"Central Brain started | Goal: {goal}")
@@ -425,40 +394,24 @@ def should_continue_to_reply(state: AgentState) -> str:
 
 def build_agent():
     workflow = StateGraph(AgentState)
-
     workflow.add_node("brain", central_brain)
     workflow.add_node("seo", seo_agent)
     workflow.add_node("content", content_agent)
     workflow.add_node("social", social_agent)
     workflow.add_node("reply", reply_agent)
     workflow.add_node("report", report_agent)
-
     workflow.set_entry_point("brain")
-
-    workflow.add_conditional_edges(
-        "brain",
-        route_after_brain,
-        {
-            "seo": "seo",
-            "content": "content",
-            "social": "social",
-            "reply": "reply"
-        }
-    )
-
+    workflow.add_conditional_edges("brain", route_after_brain, {"seo": "seo", "content": "content", "social": "social", "reply": "reply"})
     workflow.add_conditional_edges("seo", should_continue_to_content, {"content": "content", "report": "report"})
     workflow.add_conditional_edges("content", should_continue_to_social, {"social": "social", "report": "report"})
     workflow.add_conditional_edges("social", should_continue_to_reply, {"reply": "reply", "report": "report"})
-
     workflow.add_edge("reply", "report")
     workflow.add_edge("report", END)
-
     return workflow.compile()
 
 def run_agent(goal: str = "full_daily_run") -> Dict[str, Any]:
     logger.info(f"=== Starting PriceBD Agent | Goal: {goal} ===")
     app = build_agent()
-
     initial_state: AgentState = {
         "messages": [HumanMessage(content=f"Run agent with goal: {goal}")],
         "current_goal": goal,
@@ -471,7 +424,6 @@ def run_agent(goal: str = "full_daily_run") -> Dict[str, Any]:
         "brand_info": get_brand_info(),
         "error": None
     }
-
     try:
         result = app.invoke(initial_state)
         logger.info("Agent finished successfully")
@@ -504,13 +456,10 @@ if __name__ == "__main__":
     goal = sys.argv[1] if len(sys.argv) > 1 else "full_daily_run"
     print(f"\n🚀 Starting PriceBD Automation Agent (goal={goal})...\n")
     output = run_agent(goal)
-
     print("\n" + "=" * 70)
     print(output.get("report", "No report generated"))
     print("=" * 70)
-
-    report_path = "last_report.md"
-    with open(report_path, "w", encoding="utf-8") as f:
+    with open("last_report.md", "w", encoding="utf-8") as f:
         f.write(output.get("report", ""))
-    print(f"\n✅ Report saved → {report_path}")
+    print(f"\n✅ Report saved → last_report.md")
     print(f"✅ Success: {output.get('success')}")
