@@ -1,7 +1,8 @@
 """
-PriceBD Social Auto-Publisher (Zero Cost)
-Supports: Telegram Bot, Discord Webhook
-Optional later: X / Facebook (requires paid API)
+PriceBD Social Auto-Publisher
+- Telegram Bot (free)
+- Discord Webhook (free)
+- n8n Webhook → X + Facebook (OAuth in n8n)
 """
 
 import os
@@ -22,7 +23,7 @@ def _format_post(post: Dict[str, Any]) -> str:
 
     lines = [f"[{platform}]", text]
     if hashtags:
-        tags = " ".join(h if h.startswith("#") else f"#{h}" for h in hashtags)
+        tags = " ".join(h if str(h).startswith("#") else f"#{h}" for h in hashtags)
         if tags not in text:
             lines.append(tags)
     if cta:
@@ -32,10 +33,8 @@ def _format_post(post: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 def publish_to_telegram(posts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Post to a Telegram channel/group via Bot API (free)."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
     if not token or not chat_id:
         return {"ok": False, "skipped": True, "reason": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"}
 
@@ -43,17 +42,12 @@ def publish_to_telegram(posts: List[Dict[str, Any]]) -> Dict[str, Any]:
     with httpx.Client(timeout=30) as client:
         for post in posts:
             body = _format_post(post)
-            # Telegram limit ~4096 chars
             if len(body) > 4000:
                 body = body[:3990] + "..."
             try:
                 r = client.post(
                     f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": body,
-                        "disable_web_page_preview": False,
-                    },
+                    json={"chat_id": chat_id, "text": body, "disable_web_page_preview": False},
                 )
                 data = r.json()
                 results.append({
@@ -62,20 +56,13 @@ def publish_to_telegram(posts: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "message_id": (data.get("result") or {}).get("message_id"),
                     "error": data.get("description"),
                 })
-                if data.get("ok"):
-                    logger.info("Telegram posted: %s", post.get("platform"))
-                else:
-                    logger.warning("Telegram error: %s", data.get("description"))
             except Exception as e:
                 logger.error("Telegram exception: %s", e)
                 results.append({"platform": post.get("platform"), "ok": False, "error": str(e)})
-
     return {"ok": any(r.get("ok") for r in results), "results": results}
 
 def publish_to_discord(posts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Post to a Discord channel via Webhook (free)."""
     webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
     if not webhook:
         return {"ok": False, "skipped": True, "reason": "DISCORD_WEBHOOK_URL not set"}
 
@@ -86,56 +73,55 @@ def publish_to_discord(posts: List[Dict[str, Any]]) -> Dict[str, Any]:
             if len(body) > 1900:
                 body = body[:1890] + "..."
             try:
-                r = client.post(
-                    webhook,
-                    json={
-                        "content": body,
-                        "username": "PriceBD Agent",
-                    },
-                )
+                r = client.post(webhook, json={"content": body, "username": "PriceBD Agent"})
                 ok = r.status_code in (200, 204)
-                results.append({
-                    "platform": post.get("platform"),
-                    "ok": ok,
-                    "status": r.status_code,
-                    "error": None if ok else r.text[:200],
-                })
-                if ok:
-                    logger.info("Discord posted: %s", post.get("platform"))
-                else:
-                    logger.warning("Discord error %s: %s", r.status_code, r.text[:100])
+                results.append({"platform": post.get("platform"), "ok": ok, "status": r.status_code})
             except Exception as e:
                 logger.error("Discord exception: %s", e)
                 results.append({"platform": post.get("platform"), "ok": False, "error": str(e)})
-
     return {"ok": any(r.get("ok") for r in results), "results": results}
 
+def publish_to_n8n(posts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Send posts to n8n webhook → n8n posts to X + Facebook via OAuth."""
+    url = os.getenv("N8N_WEBHOOK_URL", "").strip()
+    if not url:
+        return {"ok": False, "skipped": True, "reason": "N8N_WEBHOOK_URL not set"}
+
+    payload = {"posts": posts, "source": "pricebd-agent", "site": "https://pricebd.lovable.app"}
+    try:
+        with httpx.Client(timeout=60) as client:
+            r = client.post(url, json=payload)
+            ok = r.status_code < 400
+            logger.info("n8n webhook status=%s body=%s", r.status_code, r.text[:300])
+            return {
+                "ok": ok,
+                "status": r.status_code,
+                "response": r.text[:500],
+                "posts_sent": len(posts),
+            }
+    except Exception as e:
+        logger.error("n8n webhook exception: %s", e)
+        return {"ok": False, "error": str(e)}
+
 def publish_social_posts(posts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Publish social posts to all configured free channels."""
     if not posts:
         return {"ok": False, "reason": "No posts to publish"}
 
     summary = {
+        "n8n_x_facebook": publish_to_n8n(posts),
         "telegram": publish_to_telegram(posts),
         "discord": publish_to_discord(posts),
     }
 
-    any_ok = any(
-        v.get("ok") for v in summary.values() if not v.get("skipped")
-    )
+    any_ok = any(v.get("ok") for v in summary.values() if not v.get("skipped"))
     any_configured = any(not v.get("skipped") for v in summary.values())
 
-    return {
-        "ok": any_ok,
-        "configured": any_configured,
-        "details": summary,
-    }
+    return {"ok": any_ok, "configured": any_configured, "details": summary}
 
 def save_ready_to_post_file(posts: List[Dict[str, Any]], path: str = "social_posts_ready.md") -> str:
-    """Always save a human-readable file for manual copy-paste to X/FB."""
     lines = [
         "# PriceBD – Ready to Post Social Content",
-        f"Generated for: https://pricebd.lovable.app",
+        "Generated for: https://pricebd.lovable.app",
         "",
         "Copy-paste these to X, Facebook, LinkedIn, Instagram.",
         "",
