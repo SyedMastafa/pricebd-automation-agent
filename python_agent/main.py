@@ -3,6 +3,7 @@ PriceBD Zero-Cost Full Automation Agent
 Hybrid: n8n + Python LangGraph
 Central Brain + SEO + Content + Social + Reply Agents
 Free LLMs: Groq (primary) / Gemini (fallback)
+Social auto-post: Telegram + Discord (free)
 """
 
 import os
@@ -18,6 +19,8 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+from social_publisher import publish_social_posts, save_ready_to_post_file
 
 load_dotenv()
 
@@ -36,7 +39,6 @@ def extract_json(text: str) -> Any:
         return json.loads(text)
     except Exception:
         pass
-    # Remove markdown code fences
     cleaned = re.sub(r"```(?:json)?\s*", "", text)
     cleaned = re.sub(r"\s*```", "", cleaned).strip()
     try:
@@ -65,7 +67,6 @@ def safe_get(d: Dict, *keys, default=None):
 def get_llm(temperature: float = 0.3, creative: bool = False):
     provider = os.getenv("LLM_PROVIDER", "groq").lower()
     temp = 0.6 if creative else temperature
-    # Stronger model available on this account
     model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
     if provider == "groq" and os.getenv("GROQ_API_KEY"):
@@ -112,6 +113,7 @@ class AgentState(TypedDict):
     final_report: str
     brand_info: Dict[str, str]
     error: Optional[str]
+    publish_result: Optional[Dict]
 
 def seo_agent(state: AgentState) -> AgentState:
     logger.info("Running SEO Agent...")
@@ -168,7 +170,6 @@ def content_agent(state: AgentState) -> AgentState:
     topics = safe_get(seo, "content_topics", default=[]) or []
     topics = topics[:3]
 
-    # Fallback topics if SEO returned nothing
     if not topics:
         topics = [
             {"title": "How to Find the Best iPhone Deals in Bangladesh", "keyword": "iPhone price in Bangladesh", "search_intent": "informational", "priority": "high"},
@@ -232,19 +233,18 @@ def social_agent(state: AgentState) -> AgentState:
     posts = state.get("social_posts") or []
 
     if not posts:
-        # Generate default social posts if content agent returned none
         posts = [
             {"platform": "x", "text": f"Find the lowest prices in Bangladesh on {brand['name']}. Live comparison from Daraz, Star Tech & more. {brand['url']}", "hashtags": ["#PriceBD", "#BDDeals"]},
-            {"platform": "facebook", "text": f"Tired of checking multiple sites for the best price? {brand['name']} compares live prices across major stores in Bangladesh. Start saving today!", "hashtags": ["#PriceBD"]}
+            {"platform": "facebook", "text": f"Tired of checking multiple sites for the best price? {brand['name']} compares live prices across major stores in Bangladesh. Start saving today! {brand['url']}", "hashtags": ["#PriceBD"]}
         ]
         state["social_posts"] = posts
         state["actions_taken"] = state.get("actions_taken", []) + ["Social posts generated (fallback)"]
-        return state
-
-    prompt = f"""You are a social media expert for {brand['name']} ({brand['url']}).
+    else:
+        prompt = f"""You are a social media expert for {brand['name']} ({brand['url']}).
 Brand voice: {brand['voice']}
 
 Improve these posts. Keep them engaging, add max 3 hashtags, suggest best time (Bangladesh).
+Always include the website URL in the text or CTA.
 
 Current posts:
 {json.dumps(posts, ensure_ascii=False)}
@@ -255,18 +255,37 @@ IMPORTANT: Return ONLY a valid JSON array. No markdown, no explanation.
   {{"platform": "x", "text": "...", "hashtags": ["#PriceBD"], "best_time_bst": "10:00 AM", "cta": "Compare on PriceBD"}}
 ]"""
 
-    try:
-        llm = get_llm(creative=True)
-        response = llm.invoke([HumanMessage(content=prompt)])
-        refined = extract_json(response.content)
-        if isinstance(refined, list) and refined:
-            state["social_posts"] = refined
-        else:
-            state["social_posts"] = posts
-    except Exception as e:
-        logger.error(f"Social Agent error: {e}")
+        try:
+            llm = get_llm(creative=True)
+            response = llm.invoke([HumanMessage(content=prompt)])
+            refined = extract_json(response.content)
+            if isinstance(refined, list) and refined:
+                state["social_posts"] = refined
+            else:
+                state["social_posts"] = posts
+        except Exception as e:
+            logger.error(f"Social Agent error: {e}")
 
-    state["actions_taken"] = state.get("actions_taken", []) + ["Social posts refined"]
+        state["actions_taken"] = state.get("actions_taken", []) + ["Social posts refined"]
+
+    # Always save ready-to-post file + auto-publish if credentials exist
+    final_posts = state.get("social_posts") or []
+    try:
+        save_ready_to_post_file(final_posts, "social_posts_ready.md")
+        pub = publish_social_posts(final_posts)
+        state["publish_result"] = pub
+        if pub.get("ok"):
+            state["actions_taken"] = state.get("actions_taken", []) + ["Social posts auto-published"]
+            logger.info("Social auto-publish OK: %s", pub)
+        elif pub.get("configured"):
+            state["actions_taken"] = state.get("actions_taken", []) + ["Social publish attempted (partial)"]
+        else:
+            state["actions_taken"] = state.get("actions_taken", []) + ["Social posts saved (no Telegram/Discord secrets)"]
+            logger.info("No social secrets — posts saved to social_posts_ready.md only")
+    except Exception as e:
+        logger.error(f"Publish error: {e}")
+        state["actions_taken"] = state.get("actions_taken", []) + [f"Publish error: {e}"]
+
     return state
 
 def reply_agent(state: AgentState) -> AgentState:
@@ -325,6 +344,10 @@ def report_agent(state: AgentState) -> AgentState:
     ]
     for action in state.get("actions_taken", []):
         report_lines.append(f"- {action}")
+
+    pub = state.get("publish_result") or {}
+    if pub:
+        report_lines += ["", "## Social Auto-Publish", "```json", json.dumps(pub, ensure_ascii=False, indent=2), "```"]
 
     report_lines += [
         "",
@@ -422,7 +445,8 @@ def run_agent(goal: str = "full_daily_run") -> Dict[str, Any]:
         "actions_taken": [],
         "final_report": "",
         "brand_info": get_brand_info(),
-        "error": None
+        "error": None,
+        "publish_result": None,
     }
     try:
         result = app.invoke(initial_state)
@@ -435,6 +459,7 @@ def run_agent(goal: str = "full_daily_run") -> Dict[str, Any]:
             "social_posts": result.get("social_posts", []),
             "reply_suggestions": result.get("reply_suggestions", []),
             "actions_taken": result.get("actions_taken", []),
+            "publish_result": result.get("publish_result"),
             "brand": result.get("brand_info", {})
         }
     except Exception as e:
@@ -462,4 +487,6 @@ if __name__ == "__main__":
     with open("last_report.md", "w", encoding="utf-8") as f:
         f.write(output.get("report", ""))
     print(f"\n✅ Report saved → last_report.md")
+    if os.path.exists("social_posts_ready.md"):
+        print("✅ Social posts ready → social_posts_ready.md")
     print(f"✅ Success: {output.get('success')}")
