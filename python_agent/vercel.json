@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "api.py"
+    }
+  ],
+  "env": {
+    "LLM_PROVIDER": "groq"
+  },
+  "crons": [
+    {
+      "path": "/run",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}
