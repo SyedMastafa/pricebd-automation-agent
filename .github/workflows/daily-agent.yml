@@ -1,11 +1,8 @@
 name: PriceBD Daily Automation Agent
 
 on:
-  # Run every day at 03:00 UTC = 09:00 Bangladesh Time
   schedule:
     - cron: '0 3 * * *'
-  
-  # Manual trigger from GitHub UI
   workflow_dispatch:
     inputs:
       goal:
@@ -51,10 +48,10 @@ jobs:
           echo "BRAND_NAME=PriceBD" >> .env
           echo "WEB_APP_URL=https://pricebd.lovable.app" >> .env
           echo "BRAND_VOICE=Professional, clear, helpful, trustworthy, data-driven. Focus on helping Bangladeshi users find the best prices and deals." >> .env
-          # Free social auto-post (optional)
           echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> .env
           echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
           echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> .env
+          echo "N8N_WEBHOOK_URL=${{ secrets.N8N_WEBHOOK_URL }}" >> .env
 
       - name: Run PriceBD Agent
         working-directory: python_agent
