@@ -51,6 +51,10 @@ jobs:
           echo "BRAND_NAME=PriceBD" >> .env
           echo "WEB_APP_URL=https://pricebd.lovable.app" >> .env
           echo "BRAND_VOICE=Professional, clear, helpful, trustworthy, data-driven. Focus on helping Bangladeshi users find the best prices and deals." >> .env
+          # Free social auto-post (optional)
+          echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> .env
+          echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+          echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> .env
 
       - name: Run PriceBD Agent
         working-directory: python_agent
@@ -64,7 +68,9 @@ jobs:
         if: always()
         with:
           name: pricebd-daily-report-${{ github.run_number }}
-          path: python_agent/last_report.md
+          path: |
+            python_agent/last_report.md
+            python_agent/social_posts_ready.md
           retention-days: 30
 
       - name: Summary
